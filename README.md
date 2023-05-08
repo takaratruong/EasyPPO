@@ -2,7 +2,7 @@
 This repository features a straightforward and user-friendly implementation of Proximal Policy Optimization (PPO) integrated with a custom Mujoco environment and Weights & Biases (WandB) logging. Designed with simplicity in mind, it serves as an excellent starting point for researchers who are new to PPO or seeking an easy-to-understand implementation.
 
 ## Overview
-The PPO implementation provided in this repository has been developed by The Movement Lab at Stanford. Its primary features include:
+The PPO implementation provided in this repository was developed in The Movement Lab at Stanford. Its primary features include:
 
 * A simple and clean PPO implementation, perfect for beginners or those looking for a minimalistic codebase.
 * A custom Mujoco environment example (training a humanoid to walk using DeepMimic) to help you understand how to adapt PPO for your own use cases.
