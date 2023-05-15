@@ -2,7 +2,7 @@
 EasyPPO is a straightforward and user-friendly implementation of Proximal Policy Optimization (PPO), offering integration with a custom Mujoco environment and Weights & Biases (WandB) logging. This repository is designed for simplicity and serves as an ideal starting point for researchers new to PPO or those seeking a comprehensible implementation.
 
 ## Overview
-Originating from The Movement Lab at Stanford, EasyPPO was initially created for character animation. However, it has been successfully repurposed for robotic arm control in pybullet. The only prerequisite is a compatible gym environment. Its primary features include:
+Originating from The Movement Lab at Stanford, EasyPPO was initially created for character animation. However, it has been successfully repurposed for robotic arm control envs as well. The only prerequisite is a compatible gym environment. Its primary features include:
 
 * A clean, minimalist PPO implementation suitable for both beginners and those seeking a simplified codebase.
 * An example of a custom Mujoco environment (training a humanoid to walk using DeepMimic). 
