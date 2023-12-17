@@ -38,6 +38,8 @@ class PPOBuffer:
     @torch.no_grad()
     def finish_path(self, last_val):
         assert self.ptr == self.num_steps
+
+        # This computes the returns using GAE
         vals = torch.hstack((self.val_buf, last_val))
         last_gae = torch.zeros((self.num_envs, 1)).to(self.device)
         advs = torch.zeros_like(self.rew_buf)
@@ -65,35 +67,41 @@ class PPO:
         self.env = env
         self.config = config
 
-        self.exp_name = config['exp_name']
+        self.exp_name = config['logging']['exp_name']
         self.max_iter = config['max_iter']
         self.num_envs = config['num_envs']
         self.num_steps = config['num_steps']
+        self.seed = config['seed']
 
         self.batch_size = config['policy']['batch_size']
         self.num_epochs = config['policy']['num_epochs']
         self.gamma = config['policy']['gamma']
         self.lam = config['policy']['lambda']
 
+        self.state = None
         self.num_envs = env.num_envs
-        self.obs_size = int(env.single_observation_space.shape[0])
-        self.act_size = int(env.single_action_space.shape[0])
-
+        
+        self.obs_size = int(env.unwrapped.single_observation_space.shape[0])
+        self.act_size = int(env.unwrapped.single_action_space.shape[0])
+        
         self.model = Policy(self.obs_size, self.act_size, config['policy']).to(device)
         self.storage = PPOBuffer(self.obs_size, self.act_size, self.num_envs, self.num_steps, self.gamma, self.lam)
 
+
+    # This function collects episode rollouts from the simulator. If you want to switch to isaac gym or pybullet, you will need to mofify this function.
     def collect_rollouts(self, num_steps):
         next_state, info = None, None
-        state = np.asarray(self.env.get_attr('get_obs'))
+
         for _ in range(num_steps):
             with torch.no_grad():
-                action, log_prob, value = self.model(torch.as_tensor(state, dtype=torch.float32, device=device), explore=True)
-            next_state, reward, term, done, info = self.env.step(action.cpu().numpy())
-            self.storage.push(state, action, reward, value.flatten(), log_prob, done)
-            state = next_state.copy()
-
-        # If episode terminates, the next_state is set as the start_state of the next episode. This is not desired and corrected for here.
-        if len(info.keys()) != 0:
+                action, log_prob, value = self.model(torch.as_tensor(self.state, dtype=torch.float32, device=device), explore=True)
+            next_state, reward, term, trunc, info = self.env.step(action.cpu().numpy())
+            
+            self.storage.push(self.state, action, reward, value.flatten(), log_prob, term | trunc )
+            self.state = next_state.copy() 
+    
+        # If episode terminates, gymnaisum sets the next_state as the start_state of the next episode. In these cases, the final value becomes incorrect.
+        if "_final_observation" in info:
             next_state[info['_final_observation']] = info['final_observation'][info['_final_observation']][0]
 
         next_state = self.model.filter(torch.as_tensor(next_state, dtype=torch.float32, device=device), update=False)
@@ -126,12 +134,11 @@ class PPO:
                     'info': info}, save_path)
 
     def train(self):
-        best_reward, best_track_reward = -1, -1
-        lower, upper = 0, 0
+        best_reward = -1
         info = {}
-        bin_size = 200
 
-        self.env.reset()
+        self.state, _ = self.env.reset(seed=self.seed)
+        self.state = np.array(self.state)
 
         for iterations in range(self.max_iter):
             print("-" * 50)
@@ -153,22 +160,10 @@ class PPO:
                 print(f"Ep Len: \u00B1 std: {mean_ep_len:.2f} \u00B1 {np.std(ep_lengths):.2f}")
                 wandb.log({"step": iterations, "eval/reward": mean_reward, "eval/ep_len": mean_ep_len, "train/value loss": value_loss, "train/policy loss": policy_loss})
 
-            # Save best model criteria
+            # Save best model
             if mean_reward >= best_reward and iterations % 25 == 0 and iterations >= 100:
                 best_reward = mean_reward.copy()
                 info['best_model_iter'] = iterations
                 self.save_exp_state('best_model.pt', info)
-
-            # Save best model wihtin a range
-            if iterations % 25 == 0:
-                if iterations % bin_size == 0:
-                    lower = iterations
-                    upper = iterations + bin_size
-                    best_track_reward = -1
-
-                if mean_reward > best_track_reward:
-                    best_track_reward = mean_reward.copy()
-                    info['best_model_iter'] = iterations
-                    self.save_exp_state(f'best_model_{lower}_{upper}.pt', info)
 
             print("iteration time", np.round(time.time() - iteration_start, 3))

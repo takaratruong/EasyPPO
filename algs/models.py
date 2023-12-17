@@ -80,7 +80,7 @@ class Policy(nn.Module):
 
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1 - self.policy_clip, 1 + self.policy_clip) * advantages
-        actor_loss = -(torch.min(surr1, surr2)).mean()  # + .001 * (mean_actions ** 2).mean()
+        actor_loss = -(torch.min(surr1, surr2)).mean()  # + .01* (mean_actions ** 2).mean() # mujoco gym environments already penalize actions in the rewards
 
         return actor_loss
 
@@ -94,7 +94,7 @@ class Policy(nn.Module):
         loss.backward()
         self.value_optimizer.step()
 
-
+# Used to normalize observations. Can also be used to normalize actions as well. 
 # http://notmatthancock.github.io/2017/03/23/simple-batch-stat-updates.html
 class RunningMeanStd:
     def __init__(self, shape, device='cuda'):

@@ -1,8 +1,11 @@
 import argparse
 import importlib.util
-import json
 import argparse
 import importlib.util
+
+# This script loads a config dictionary that can be edited via command line arguments.  
+# It builds upon argparse and 1) initializes the arguments to be based on the config file 2) takes the command line arguments and modifies the initialization. 
+# This is useful when developing custom environments or policies where there is a need quickly add/remove hyperparameters. 
 
 def load_dict(path):
     spec = importlib.util.spec_from_file_location("config", path)
@@ -34,7 +37,7 @@ def add_arguments(parser, config, prefix=''):
         if isinstance(value, dict):
             add_arguments(parser, value, new_prefix)
         else:
-            arg_name = f'-{new_prefix}'
+            arg_name = f'--{new_prefix}'
             value_type = type(value)
             if value_type == bool:
                 parser.add_argument(arg_name, type=parse_bool, default=value, help=f'{arg_name} value')
@@ -53,7 +56,7 @@ def update_config(args, config, prefix=''):
 
 def load_config(dict_path=None):
     path_parser = argparse.ArgumentParser(add_help=False)
-    path_parser.add_argument('-config', type=str, default=dict_path, help='Path to the dictionary file')
+    path_parser.add_argument('--config', type=str, default=dict_path, help='Path to the dictionary file')
     path_args, unknown_args = path_parser.parse_known_args()
 
     assert path_args.config is not None, 'Config Path Not Provided'
