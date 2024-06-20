@@ -2,155 +2,252 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+class DiagonalPopArt(torch.nn.Module):
+    def __init__(self, dim: int, weight: torch.Tensor, bias: torch.Tensor, momentum:float=0.1):
+        super().__init__()
+        self.epsilon = 1e-5
 
-def layer_init(layer, std=.1, bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.orthogonal_(layer.bias.data.view(1, -1), bias_const)
-    return layer
+        self.momentum = momentum
+        self.register_buffer("m", torch.zeros((dim,), dtype=torch.float64))
+        self.register_buffer("v", torch.full((dim,), self.epsilon, dtype=torch.float64))
+        self.register_buffer("debias", torch.zeros(1, dtype=torch.float64))
+
+        self.weight = weight
+        self.bias = bias
+
+    def forward(self, x, unnorm=False):
+        debias = self.debias.clip(min=self.epsilon)   # type: ignore
+        mean = self.m/debias
+        var = (self.v - self.m.square()).div_(debias) # type: ignore
+        if unnorm:
+            return (mean + torch.sqrt(var) * x).to(x.dtype)
+
+        return ((x - mean) * torch.rsqrt(var)).to(x.dtype)
+
+    @torch.no_grad()
+    def update(self, x):
+        # ART
+        running_m = torch.mean(x, dim=0)
+        running_v = torch.mean(x.square(), dim=0)
+        new_m = self.m.mul(1-self.momentum).add_(running_m, alpha=self.momentum) # type: ignore
+        new_v = self.v.mul(1-self.momentum).add_(running_v, alpha=self.momentum) # type: ignore
+        
+        # POP 
+        std = (self.v - self.m.square()).sqrt_() # type: ignore
+        new_std_inv = (new_v - new_m.square()).rsqrt_()
+
+        scale = std.mul_(new_std_inv)
+        shift = (self.m - new_m).mul_(new_std_inv)
+
+        self.bias.data.mul_(scale).add_(shift)
+        self.weight.data.mul_(scale.unsqueeze_(-1))
+
+        self.debias.data.mul_(1-self.momentum).add_(1.0*self.momentum) # type: ignore
+        self.m.data.copy_(new_m) # type: ignore
+        self.v.data.copy_(new_v) # type: ignore
 
 
-def create_network(input_size, hidden_sizes, output_size, activation=nn.ReLU(), output_activation=None):
-    layers = [layer_init(nn.Linear(input_size, hidden_sizes[0])), activation]
-    for i in range(1, len(hidden_sizes)):
-        layers.append(layer_init(nn.Linear(hidden_sizes[i - 1], hidden_sizes[i])))
-        layers.append(activation)
-    layers.append(layer_init(nn.Linear(hidden_sizes[-1], output_size)))
 
-    if output_activation is not None:
-        layers.append(output_activation)
+class Critic(torch.nn.Module):
+        def __init__(self, state_dim, goal_dim, value_dim=1, latent_dim=256):
+            super().__init__()
+            self.rnn = torch.nn.GRU(state_dim, latent_dim, batch_first=True)
 
-    return nn.Sequential(*layers)
+            self.mlp = torch.nn.Sequential(
+                torch.nn.Linear(latent_dim+goal_dim, 1024),
+                torch.nn.ReLU6(),
+                torch.nn.Linear(1024, 512),
+                torch.nn.ReLU6(),
+                torch.nn.Linear(512, value_dim)
+            )
+            
+            for n, p in self.mlp.named_parameters():
+                if "bias" in n:
+                    torch.nn.init.constant_(p, 0.)
+                elif "weight" in n:
+                    torch.nn.init.uniform_(p, -0.0001, 0.0001)
+            self.all_inst = torch.arange(0)
+
+        def forward(self, state, seq_end_frame, goal=None):
+            n_inst = state.size(0)
+
+            if n_inst > self.all_inst.size(0):
+                self.all_inst = torch.arange(n_inst, dtype=seq_end_frame.dtype, device=seq_end_frame.device)
+            state, _ = self.rnn(state)
+
+            # pull the last one out (recall that this is a GRU, so the last one contains all the needed information)
+            state = state[(self.all_inst[:n_inst], torch.clip(seq_end_frame, max=state.size(1)-1))]
+            
+            if goal is not None:
+                state = torch.cat((state, goal), -1)
+
+            return self.mlp(state)
+
+class Actor(torch.nn.Module):
+    def __init__(self, state_dim, goal_dim, act_dim, latent_dim=256, explore_noise=None):
+        super().__init__()
+        
+        self.rnn = torch.nn.GRU(state_dim, latent_dim, batch_first=True)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim+goal_dim, 512),
+            torch.nn.ReLU6(),
+            torch.nn.Linear(512, 512),
+            torch.nn.ReLU6()
+        )
+
+        self.mu = torch.nn.Linear(512, act_dim)
+        self.log_sigma = torch.nn.Linear(512, act_dim)
+        with torch.no_grad():
+            torch.nn.init.constant_(self.log_sigma.bias, -3)
+            torch.nn.init.uniform_(self.log_sigma.weight, -0.0001, 0.0001)
+            self.all_inst = torch.arange(0)
+        
+        self.explore_noise = explore_noise
+        self.all_inst = torch.arange(0)
+
+    def forward(self, state, seq_end_frame, goal=None):
+        if self.rnn is None:
+            state = state.view(state.size(0), -1)
+        else:
+            n_inst = state.size(0)
+            if n_inst > self.all_inst.size(0):
+                self.all_inst = torch.arange(n_inst, dtype=seq_end_frame.dtype, device=seq_end_frame.device)
+
+            # Embed the sequence of states, then pull out the last state of each sequence (remove the padding)    
+            state, _ = self.rnn(state)
+            state = state[(self.all_inst[:n_inst], torch.clip(seq_end_frame, max=state.size(1)-1))]
+
+        if goal is not None:
+            state = torch.cat((state, goal), -1)
+        latent = self.mlp(state)
+
+        mu = self.mu(latent)
+        
+        if self.explore_noise is None:
+            sigma = torch.exp(self.log_sigma(latent)) + 1e-8
+        else:
+            sigma = self.explore_noise
+        
+        return torch.distributions.normal.Normal(mu, sigma)
 
 
 class Policy(nn.Module):
-    def __init__(self, num_inputs, num_outputs, config):
+    def __init__(self, state_dim, action_dim, goal_dim, value_dim, explore_noise=None, noramlize_values=False):
         super(Policy, self).__init__()
-        self.std = config['std']
-        self.pol_hidden_layer = config['pol_hidden']
-        self.val_hidden_layer = config['val_hidden']
-        self.policy_lr = config['policy_lr']
-        self.value_lr = config['value_lr']
-        self.policy_clip = config['policy_clip']
-        self.distribution = torch.distributions.normal.Normal
+        
+        assert value_dim <= 1 or noramlize_values, "Normalization must be enabled when value_dim > 1"
+        
+        self.explore_noise = explore_noise        
+        self.state_dim = state_dim
+        self.goal_dim = goal_dim
+        
+        self.policy = Actor(self.state_dim, self.goal_dim, action_dim, explore_noise=explore_noise) 
+        self.val_fn = Critic(self.state_dim, self.goal_dim, value_dim)
 
-        self.filter = RunningMeanStd(num_inputs)
+        self.state_normalizer = RunningMeanStd(state_dim, 10.0) 
+        self.val_normalizer = DiagonalPopArt(value_dim, self.val_fn.mlp[-1].weight, self.val_fn.mlp[-1].bias) if noramlize_values else None # type: ignore
+        
+    def process_obs(self, obs, norm=True):
+        state, goal = obs, None 
+        if self.goal_dim > 0: 
+            state = obs[...,:-self.goal_dim]
+            goal = obs[...,-self.goal_dim:] 
+        state = state.view(*state.shape[:-1], -1, self.state_dim)
+        return self.state_normalizer(state) if norm else state, goal
 
-        self.policy = create_network(num_inputs, self.pol_hidden_layer, num_outputs, activation=nn.ReLU(), output_activation=None)
-        self.val_fn = create_network(num_inputs, self.val_hidden_layer, 1, activation=nn.ReLU(), output_activation=None)
+    def forward(self, obs, seq_end_frame, explore=True):
+        state, goals = self.process_obs(obs, norm=False)
+        state = self.state_normalizer(state)    
 
-        self.policy_optimizer = optim.AdamW(self.policy.parameters(), lr=self.policy_lr)
-        self.value_optimizer = optim.AdamW(self.val_fn.parameters(), lr=self.value_lr)
-
-    def forward(self, inputs, explore=True, update_filter=True):
-        inputs = self.filter(inputs, update=update_filter)
-        vf_pred = self.val_fn(inputs)
-        mean = self.policy(inputs)
-
-        action_dist = self.distribution(mean, self.std)
-        action = action_dist.sample()
-        log_prob = action_dist.log_prob(action).sum(-1)
+        val = self.val_fn(state, seq_end_frame, goals)
+        if self.val_normalizer is not None:                     
+            val = self.val_normalizer(val, unnorm=True) 
+        
+        pi = self.policy(state, seq_end_frame, goals)
+        action = pi.sample()
+        log_prob = pi.log_prob(action).sum(-1)
 
         if explore == False:
-            action = action_dist.loc
+            action = pi.loc
+        
+        return action, log_prob, val 
 
-        return action, log_prob, vf_pred
+    def value_loss(self, obs, returns, seq_end_frame):
 
-    def value_loss(self, states, returns):
-        states = self.filter(states, update=False)
-        curr_values = self.val_fn(states)
-        critic_loss = .5 * torch.nn.functional.mse_loss(curr_values.flatten(), returns)
+        # self.val_normalizer.update(returns) 
+        # returns = self.val_normalizer(returns)
+        
+        states, goals = self.process_obs(obs) 
+        curr_values = self.val_fn(states, seq_end_frame, goals)
+        assert curr_values.shape == returns.shape, f"curr_values: {curr_values.shape}, returns: {returns.shape}"
+        
+        critic_loss = .5* (curr_values - returns).square().mean() 
+
         return critic_loss
 
-    def policy_loss(self, states, actions, old_log_probs, returns):
-        states = self.filter(states, update=False)
-        with torch.no_grad():
-            values = self.val_fn(states)
+    def policy_loss(self, obs, actions, old_log_probs, advantages, seq_end_frame=None):
+        states, goals = self.process_obs(obs)
 
-        advantages = (returns.reshape(-1, 1) - values)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
+        sigma, mu = torch.std_mean(advantages, dim=0, unbiased=True)
+        advantages = (advantages - mu) / (sigma + 1e-5) 
+        
+        pi = self.policy(states, seq_end_frame, goals) 
+        log_probs = pi.log_prob(actions).sum(-1, keepdim=True)
 
-        mean_actions = self.policy(states)
-        curr_action_dist = self.distribution(mean_actions, self.std)
-        log_probs = curr_action_dist.log_prob(actions).sum(-1)
-
-        ratio = torch.exp(log_probs - old_log_probs).unsqueeze(1)
+        assert log_probs.shape == old_log_probs.shape, f"log_probs: {log_probs.shape}, old_log_probs: {old_log_probs.shape}"
+        ratio = torch.exp(log_probs - old_log_probs) 
 
         surr1 = ratio * advantages
-        surr2 = ratio.clamp(1 - self.policy_clip, 1 + self.policy_clip) * advantages
-        actor_loss = -(torch.min(surr1, surr2)).mean()  # + .01* (mean_actions ** 2).mean() # mujoco gym environments already penalize actions in the rewards
+        surr2 = ratio.clamp(1-.2, 1+.2) * advantages
+        
+        actor_loss = -torch.min(surr1, surr2 ).sum(-1).mean() # + .01* (mean_actions ** 2).mean() e.g., save the mean action in the buffer and then use it here 
 
         return actor_loss
 
-    def policy_step(self, loss):
-        self.policy_optimizer.zero_grad()
-        loss.backward()
-        self.policy_optimizer.step()
+    def evaluate(self, obs, seq_end_frame=None):
+        state, goal = self.process_obs(obs)
+        val = self.val_fn(state, seq_end_frame, goal)   
+        if self.val_normalizer is not None:                     
+            val = self.val_normalizer(val, unnorm=True) 
+        return val
 
-    def value_step(self, loss):
-        self.value_optimizer.zero_grad()
-        loss.backward()
-        self.value_optimizer.step()
+class RunningMeanStd(torch.nn.Module):
+    def __init__(self, dim: int, clamp: float=0):
+        super().__init__()
+        self.epsilon = 1e-5
+        self.clamp = clamp
+        self.register_buffer("mean", torch.zeros(dim, dtype=torch.float64))
+        self.register_buffer("var", torch.ones(dim, dtype=torch.float64))
+        self.register_buffer("count", torch.ones((), dtype=torch.float64))
 
-# Used to normalize observations. Can also be used to normalize actions as well. 
-# http://notmatthancock.github.io/2017/03/23/simple-batch-stat-updates.html
-class RunningMeanStd:
-    def __init__(self, shape, device='cuda'):
-        self.device = device
-        if shape is None:
-            self.mean = np.zeros(1)
-            self.std = np.zeros(1)
-        else:
-            self.n = torch.zeros(1, dtype=torch.float32, device=device)
-            self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
-            self.std = torch.ones(shape, dtype=torch.float32,  device=device)
-
-        self.std_min = 0.03
-        self.clip = 10.0
-
+    def forward(self, x, unnorm=False):
+        mean = self.mean.to(torch.float32)
+        var = self.var.to(torch.float32)+self.epsilon # type: ignore
+        if unnorm:
+            if self.clamp:
+                x = torch.clamp(x, min=-self.clamp, max=self.clamp)
+            return mean + torch.sqrt(var) * x
+        x = (x - mean) * torch.rsqrt(var)
+        if self.clamp:
+            return torch.clamp(x, min=-self.clamp, max=self.clamp)
+        return x
+    
+    @torch.no_grad()
     def update(self, x):
-        n1 = self.n
-        n2 = x.shape[0]
+        x = x.view(-1, x.size(-1))
+        var, mean = torch.var_mean(x, dim=0, unbiased=True)
+        count = x.size(0)
+        count_ = count + self.count
+        delta = mean - self.mean
+        m = self.var * self.count + var * count + delta**2 * self.count * count / count_ # type: ignore
 
-        old_mean = self.mean
-        old_std = self.std
-        batch_mean = torch.mean(x, dim=0).to(self.device)
-        batch_std = torch.std(x, dim=0).to(self.device)
+        self.mean.copy_(self.mean+delta*count/count_) # type: ignore
+        self.var.copy_(m / count_) # type: ignore
+        self.count.copy_(count_) # type: ignore
 
-        self.mean = n1 / (n1 + n2) * old_mean + n2 / (n1 + n2) * batch_mean
-        S = n1 / (n1 + n2) * old_std ** 2 + n2 / (n1 + n2) * batch_std ** 2 + n1 * n2 / (n1 + n2) ** 2 * (old_mean - batch_mean) ** 2
-        self.std = torch.sqrt(S)
-        self.n += n2
-
-    def __call__(self, x, update=True):
-        if update:
-            self.update(x)
-
-        x = x.to(self.device) - self.mean.to(self.device)
-        std = self.std.to(self.device)
-
-        std = torch.clip(std, self.std_min, 1e5)
-
-        x = x / (std + 1e-5)
-        x = torch.clip(x, -self.clip, self.clip)
-        return x
-
-    def unfilter(self, x):
-        x = torch.tensor(x).to(self.device)
-        x = x * self.std
-        x = x + self.mean
-        return x
-
-    def state_dict(self):
-        state = {}
-        state['n'] = self.n
-        state['m'] = self.mean
-        state['s'] = self.std
-        return state
-
-    def load_state_dict(self, state):
-        self.n = state['n']
-        self.mean = state['m']
-        self.std = state['s']
+    def reset_counter(self):
+        self.count.fill_(1) # type: ignore
