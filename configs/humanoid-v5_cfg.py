@@ -14,7 +14,7 @@ config = {
     },
 
     'env': {
-        'env_id': 'Humanoid-v4', # works with any gym environment. If using mujoco envs like (Humanoid-v4), downgrade to mujoco 2.3.*
+        'env_id': 'Humanoid-v5', # works with any gym environment. If using mujoco envs like (Humanoid-v4), downgrade to mujoco 2.3.*
         },
 
     'policy': {

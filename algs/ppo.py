@@ -4,6 +4,7 @@ import os
 from algs.models import Policy
 import torch
 import numpy as np
+import glob
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class PPOBuffer:
@@ -136,10 +137,10 @@ class PPO:
     def train(self):
         best_reward = -1
         info = {}
-
+        prev_video_count = len(glob.glob(os.path.join(f'results/videos/{wandb.run.id}/', "*.mp4")))  # Initial video count
+        # import ipdb; ipdb.set_trace() 
         self.state, _ = self.env.reset(seed=self.seed)
         self.state = np.array(self.state)
-
         for iterations in range(self.max_iter):
             print("-" * 50)
             print("iteration: ", iterations)
@@ -158,7 +159,15 @@ class PPO:
             if iterations % 5 == 0:
                 print(f"Reward: \u00B1 std: {mean_reward:.2f} \u00B1 {np.std(rewards):.2f}")
                 print(f"Ep Len: \u00B1 std: {mean_ep_len:.2f} \u00B1 {np.std(ep_lengths):.2f}")
-                wandb.log({"step": iterations, "eval/reward": mean_reward, "eval/ep_len": mean_ep_len, "train/value loss": value_loss, "train/policy loss": policy_loss})
+                
+                # silly hack to get wandb to upload video's because its broken in gymnasium 1.0.0 for now.... this should be automatic but its not, so I'm manually doing it here... 
+                # basically, if their is a new video file in the folder then upload it. 
+                video_files = sorted(glob.glob(os.path.join(f'results/videos/{wandb.run.id}/', "*.mp4")))  # Get all video files
+                if len(video_files) > prev_video_count:   
+                    wandb.log({"step": iterations, "eval/reward": mean_reward, "eval/ep_len": mean_ep_len, "train/value loss": value_loss, "train/policy loss": policy_loss, "Video": wandb.Video(video_files[-1])})
+                    prev_video_count = len(video_files) 
+                else: 
+                    wandb.log({"step": iterations, "eval/reward": mean_reward, "eval/ep_len": mean_ep_len, "train/value loss": value_loss, "train/policy loss": policy_loss})
 
             # Save best model
             if mean_reward >= best_reward and iterations % 25 == 0 and iterations >= 100:
