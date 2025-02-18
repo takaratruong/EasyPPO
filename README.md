@@ -17,6 +17,7 @@ To get started with this implementation, follow these steps:
    4. pytorch  
    5. wandb
    
-3. Run the example script to train the model (run.py) 
-4. Load and run the trained model (analysis.py)
+3. Run the example script to train the model (train.py) 
+4. Load and run the trained model (vis.py)
 
+Example command: python train.py --config configs/humanoid-v5_cfg.cpy
